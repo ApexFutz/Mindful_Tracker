@@ -1,0 +1,576 @@
+import { ChangeDetectionStrategy, Component, computed, signal, OnInit, OnDestroy, effect, isDevMode } from '@angular/core';
+import { FormsModule } from '@angular/forms';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, User } from 'firebase/auth';
+import {
+  getFirestore, doc, addDoc, onSnapshot, collection, query, orderBy, deleteDoc,
+  setLogLevel, Firestore, Unsubscribe, CollectionReference
+} from 'firebase/firestore';
+
+// Define the interfaces for all document types
+interface MoodEntry {
+  id?: string;
+  moodScore: number;
+  notes: string;
+  timestamp: number;
+  userId: string;
+}
+
+interface TriggerItem {
+  id?: string;
+  name: string;
+  timestamp: number;
+  userId: string;
+}
+
+interface CravingsItem {
+  id?: string;
+  name: string;
+  timestamp: number;
+  userId: string;
+}
+
+// Define the possible views in the application
+type AppView = 'log' | 'history' | 'triggers' | 'cravings';
+
+@Component({
+  selector: 'app-root',
+  standalone: true,
+  imports: [FormsModule], // Needed for [(ngModel)]
+  template: `
+    <!-- Main App Container -->
+    <div class="min-h-screen bg-gray-50 p-4 sm:p-8 flex flex-col items-center">
+      <div class="w-full max-w-lg bg-white rounded-3xl shadow-2xl p-6 sm:p-8 space-y-6">
+
+        <!-- Header -->
+        <header class="text-center space-y-1">
+          <h1 class="text-3xl font-extrabold text-indigo-700">Mindful Tracker</h1>
+          <p class="text-gray-500">Log, track, and identify your emotional patterns.</p>
+        </header>
+
+        <!-- Loading/Error State -->
+        @if (isLoading()) {
+          <div class="text-center py-10">
+            <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500 mx-auto"></div>
+            <p class="mt-4 text-indigo-600">Loading application...</p>
+          </div>
+        } @else if (error()) {
+          <div class="p-4 bg-red-100 border border-red-400 text-red-700 rounded-lg">
+            Error: {{ error() }}
+          </div>
+        } @else {
+          <!-- User ID Display (Mandatory for Multi-user Apps) -->
+          <div class="text-xs text-gray-400 text-center truncate p-2 border border-gray-100 rounded-lg">
+            User ID: {{ userId() || 'N/A' }}
+          </div>
+
+          <!-- Navigation -->
+          <nav class="grid grid-cols-4 gap-2 p-1 bg-gray-100 rounded-xl">
+            @for (view of views; track view.key) {
+              <button
+                (click)="currentView.set(view.key)"
+                [class.bg-white]="currentView() === view.key"
+                [class.text-indigo-700]="currentView() === view.key"
+                [class.text-gray-500]="currentView() !== view.key"
+                class="py-2 text-sm font-medium rounded-xl transition-colors shadow-sm"
+              >
+                {{ view.name }}
+                @if (view.countSignal) {
+                  ({{ view.countSignal() }})
+                }
+              </button>
+            }
+          </nav>
+
+          <!-- Content View -->
+          <div class="pt-4">
+            @switch (currentView()) {
+              @case ('log') {
+                <div class="space-y-6">
+                  <h2 class="text-xl font-semibold text-gray-800">How are you feeling right now?</h2>
+
+                  <!-- Mood Score Input -->
+                  <div class="space-y-3 p-4 bg-indigo-50 rounded-xl border border-indigo-200">
+                    <div class="text-center">
+                      <span class="text-5xl font-bold text-indigo-600">
+                        {{ newEntryScore() }}
+                      </span>
+                      <p class="text-gray-600 mt-1">{{ moodDescription() }}</p>
+                    </div>
+
+                    <input
+                      type="range"
+                      min="1"
+                      max="10"
+                      [(ngModel)]="newEntryScore"
+                      class="w-full h-2 bg-indigo-200 rounded-lg appearance-none cursor-pointer"
+                    />
+                    <div class="flex justify-between text-sm text-gray-500">
+                      <span>1 (Worst)</span>
+                      <span>10 (Best)</span>
+                    </div>
+                  </div>
+
+                  <!-- Notes Input -->
+                  <div class="space-y-2">
+                    <label for="notes" class="block text-sm font-medium text-gray-700">Notes / Context</label>
+                    <textarea
+                      id="notes"
+                      rows="3"
+                      [(ngModel)]="newEntryNotes"
+                      class="w-full border border-gray-300 rounded-lg p-3 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
+                      placeholder="E.g., I just finished a workout, feeling great!"
+                    ></textarea>
+                  </div>
+
+                  <!-- Submission Button -->
+                  <button
+                    (click)="logMood()"
+                    [disabled]="isSubmitting()"
+                    class="w-full py-3 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700 transition duration-300 disabled:opacity-50 disabled:cursor-not-allowed shadow-md shadow-indigo-200"
+                  >
+                    {{ isSubmitting() ? 'Logging...' : 'Log My Mood' }}
+                  </button>
+                  @if (successMessage()) {
+                    <p class="text-green-600 text-center mt-2">{{ successMessage() }}</p>
+                  }
+                </div>
+              }
+              @case ('history') {
+                <div class="space-y-4">
+                  <h2 class="text-xl font-semibold text-gray-800">Mood History</h2>
+                  @if (sortedEntries().length === 0) {
+                    <p class="text-gray-500 text-center py-4">No entries logged yet. Log your first mood!</p>
+                  } @else {
+                    <ul class="space-y-3">
+                      @for (entry of sortedEntries(); track entry.id) {
+                        <li class="p-4 bg-white border border-gray-200 rounded-xl shadow-sm hover:shadow-md transition duration-150">
+                          <div class="flex justify-between items-center mb-1">
+                            <span class="text-lg font-bold"
+                                  [ngClass]="getScoreColor(entry.moodScore)">
+                              Score: {{ entry.moodScore }}
+                            </span>
+                            <span class="text-sm text-gray-500">{{ formatDate(entry.timestamp) }}</span>
+                          </div>
+                          @if (entry.notes) {
+                            <p class="text-gray-600 italic text-sm border-t border-gray-100 pt-2 mt-2">
+                              "{{ entry.notes }}"
+                            </p>
+                          }
+                        </li>
+                      }
+                    </ul>
+                  }
+                </div>
+              }
+              @case ('triggers') {
+                <div class="space-y-4">
+                  <h2 class="text-xl font-semibold text-gray-800">My Emotional Triggers</h2>
+                  <p class="text-sm text-gray-500">What consistently pushes your mood down? (e.g., lack of sleep, social media).</p>
+
+                  <!-- Add Trigger Form -->
+                  <div class="flex space-x-2">
+                    <input
+                      type="text"
+                      [(ngModel)]="newTriggerName"
+                      class="flex-1 border border-gray-300 rounded-lg p-3 text-sm focus:ring-indigo-500 focus:border-indigo-500"
+                      placeholder="Add a new trigger (e.g. 'Skipping Breakfast')"
+                    />
+                    <button
+                      (click)="addTrigger()"
+                      [disabled]="isSubmitting() || !newTriggerName()"
+                      class="px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700 transition disabled:opacity-50"
+                    >
+                      Add
+                    </button>
+                  </div>
+
+                  <!-- Triggers List -->
+                  @if (triggers().length === 0) {
+                    <p class="text-gray-500 text-center py-4">No triggers defined yet.</p>
+                  } @else {
+                    <ul class="space-y-2 pt-2">
+                      @for (item of triggers(); track item.id) {
+                        <li class="flex justify-between items-center p-3 bg-gray-100 rounded-lg shadow-inner">
+                          <span class="text-gray-700 font-medium">{{ item.name }}</span>
+                          <button
+                            (click)="deleteItem(item.id!, 'trigger')"
+                            class="text-red-500 hover:text-red-700 transition"
+                          >
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                              <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm4 0a1 1 0 10-2 0v6a1 1 0 102 0V8z" clip-rule="evenodd" />
+                            </svg>
+                          </button>
+                        </li>
+                      }
+                    </ul>
+                  }
+                </div>
+              }
+              @case ('cravings') {
+                <div class="space-y-4">
+                  <h2 class="text-xl font-semibold text-gray-800">My Recurring Cravings</h2>
+                  <p class="text-sm text-gray-500">What specific things do you struggle with controlling? (e.g., processed foods, doomscrolling).</p>
+
+                  <!-- Add Cravings Form -->
+                  <div class="flex space-x-2">
+                    <input
+                      type="text"
+                      [(ngModel)]="newCravingsName"
+                      class="flex-1 border border-gray-300 rounded-lg p-3 text-sm focus:ring-indigo-500 focus:border-indigo-500"
+                      placeholder="Add a new craving (e.g. 'Late Night Netflix')"
+                    />
+                    <button
+                      (click)="addCravings()"
+                      [disabled]="isSubmitting() || !newCravingsName()"
+                      class="px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700 transition disabled:opacity-50"
+                    >
+                      Add
+                    </button>
+                  </div>
+
+                  <!-- Cravings List -->
+                  @if (cravings().length === 0) {
+                    <p class="text-gray-500 text-center py-4">No cravings defined yet.</p>
+                  } @else {
+                    <ul class="space-y-2 pt-2">
+                      @for (item of cravings(); track item.id) {
+                        <li class="flex justify-between items-center p-3 bg-gray-100 rounded-lg shadow-inner">
+                          <span class="text-gray-700 font-medium">{{ item.name }}</span>
+                          <button
+                            (click)="deleteItem(item.id!, 'cravings')"
+                            class="text-red-500 hover:text-red-700 transition"
+                          >
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                              <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm4 0a1 1 0 10-2 0v6a1 1 0 102 0V8z" clip-rule="evenodd" />
+                            </svg>
+                          </button>
+                        </li>
+                      }
+                    </ul>
+                  }
+                </div>
+              }
+            }
+          </div>
+        }
+      </div>
+    </div>
+  `,
+  styles: [`
+    /* Ensure good contrast for the range slider track */
+    input[type=range]::-webkit-slider-runnable-track {
+      background: #c7d2fe; /* indigo-200 */
+    }
+    input[type=range]::-moz-range-track {
+      background: #c7d2fe; /* indigo-200 */
+    }
+    /* Style the thumb/handle */
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      margin-top: -6px; /* Adjust to vertically align thumb */
+      height: 16px;
+      width: 16px;
+      border-radius: 9999px; /* full rounded */
+      background: #4f46e5; /* indigo-600 */
+      cursor: pointer;
+      box-shadow: 0 0 0 4px rgba(79, 70, 229, 0.3);
+    }
+  `],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+})
+export class App implements OnInit, OnDestroy {
+  // --- Signals for State Management ---
+  currentView = signal<AppView>('log');
+  
+  // Mood Logging State
+  newEntryScore = signal<number>(5);
+  newEntryNotes = signal<string>('');
+  moodEntries = signal<MoodEntry[]>([]);
+
+  // Triggers State
+  newTriggerName = signal<string>('');
+  triggers = signal<TriggerItem[]>([]);
+
+  // Cravings State
+  newCravingsName = signal<string>('');
+  cravings = signal<CravingsItem[]>([]);
+
+  // App Status State
+  isLoading = signal<boolean>(true);
+  isSubmitting = signal<boolean>(false);
+  error = signal<string | null>(null);
+  userId = signal<string | null>(null);
+  successMessage = signal<string | null>(null);
+
+  // Define views for dynamic navigation rendering
+  views = [
+    { key: 'log', name: 'Log', countSignal: null },
+    { key: 'history', name: 'History', countSignal: this.moodEntries },
+    { key: 'triggers', name: 'Triggers', countSignal: this.triggers },
+    { key: 'cravings', name: 'Cravings', countSignal: this.cravings },
+  ];
+
+  // --- Derived State (Computed Signals) ---
+  sortedEntries = computed(() => {
+    // Sorts the entries by timestamp (newest first)
+    return [...this.moodEntries()].sort((a, b) => b.timestamp - a.timestamp);
+  });
+
+  moodDescription = computed(() => {
+    const score = this.newEntryScore();
+    if (score === 1) return 'Deep Distress / Crisis';
+    if (score <= 3) return 'Very Low / Struggling';
+    if (score <= 5) return 'Neutral / Stable';
+    if (score <= 7) return 'Good / Positive';
+    if (score <= 9) return 'Very Happy / Energized';
+    if (score === 10) return 'Peak State / Excellent';
+    return '';
+  });
+
+  // --- Firebase/Firestore Instances ---
+  private db: Firestore | null = null;
+  private authReady = signal(false);
+  private unsubscribes: Unsubscribe[] = [];
+
+  constructor() {
+    // Effect to handle success message cleanup
+    effect(() => {
+      if (this.successMessage()) {
+        const timer = setTimeout(() => this.successMessage.set(null), 3000);
+        return () => clearTimeout(timer);
+      }
+    });
+
+    // Effect to handle ALL Firestore data subscriptions once authenticated
+    effect(() => {
+      if (this.authReady() && this.db && this.userId()) {
+        this.unsubscribes.forEach(unsub => unsub()); // Cleanup previous subscriptions
+        this.unsubscribes = [];
+
+        // 1. Mood Entries Subscription
+        this.unsubscribes.push(this.setupDataSubscription<MoodEntry>('mood_entries', this.moodEntries));
+
+        // 2. Triggers Subscription
+        this.unsubscribes.push(this.setupDataSubscription<TriggerItem>('user_triggers', this.triggers));
+
+        // 3. Cravings Subscription
+        this.unsubscribes.push(this.setupDataSubscription<CravingsItem>('user_cravings', this.cravings));
+
+      } else if (!this.authReady()) {
+        this.isLoading.set(true);
+      }
+    }, { allowSignalWrites: true });
+  }
+
+  async ngOnInit(): Promise<void> {
+    if (isDevMode()) {
+      setLogLevel('debug'); // Enable Firestore logging in development
+    }
+    this.initializeFirebase();
+  }
+
+  // Generic path construction function
+  private getCollectionPath(collectionName: string): string {
+    const appId = typeof (__app_id as unknown) !== 'undefined' ? (__app_id as string) : 'default-app-id';
+    const currentUserId = this.userId();
+    if (!currentUserId) {
+      // Return a safe, but unusable path if userId is missing (should be caught by authReady check)
+      return `artifacts/${appId}/temp/unknown/${collectionName}`;
+    }
+    // Path format: /artifacts/{appId}/users/{userId}/{collectionName}
+    return `artifacts/${appId}/users/${currentUserId}/${collectionName}`;
+  }
+
+  // Generic subscription setup function
+  private setupDataSubscription<T extends { timestamp: number }>(collectionName: string, dataSignal: (items: T[]) => void): Unsubscribe {
+    const db = this.db!;
+    const entriesCollection = collection(db, this.getCollectionPath(collectionName)) as CollectionReference<T>;
+    const q = query(entriesCollection, orderBy('timestamp', 'desc'));
+
+    return onSnapshot(q, (snapshot) => {
+      const items = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      dataSignal(items as T[]);
+      this.isLoading.set(false);
+    }, (err) => {
+      console.error(`Firestore Error (${collectionName}):`, err);
+      this.error.set(`Failed to load ${collectionName} data.`);
+      this.isLoading.set(false);
+    });
+  }
+
+  async initializeFirebase(): Promise<void> {
+    try {
+      const firebaseConfig = JSON.parse(typeof (__firebase_config as unknown) !== 'undefined' ? (__firebase_config as string) : '{}');
+      if (Object.keys(firebaseConfig).length === 0) {
+        throw new Error("Firebase configuration is missing.");
+      }
+
+      const app = initializeApp(firebaseConfig);
+      this.db = getFirestore(app);
+      const auth = getAuth(app);
+
+      onAuthStateChanged(auth, async (user) => {
+        if (user) {
+          this.userId.set(user.uid);
+          this.authReady.set(true);
+        } else {
+          // Attempt sign in if not authenticated
+          const token = typeof (__initial_auth_token as unknown) !== 'undefined' ? (__initial_auth_token as string) : null;
+          try {
+            if (token) {
+              const credentials = await signInWithCustomToken(auth, token);
+              this.userId.set(credentials.user.uid);
+            } else {
+              const credentials = await signInAnonymously(auth);
+              this.userId.set(credentials.user.uid);
+            }
+          } catch (e) {
+            console.error("Auth Error:", e);
+            this.error.set("Authentication failed. Cannot access data.");
+            this.isLoading.set(false);
+          }
+          this.authReady.set(true);
+        }
+      });
+    } catch (e) {
+      console.error("Firebase Init Error:", e);
+      this.error.set("Application initialization failed. See console.");
+      this.isLoading.set(false);
+    }
+  }
+
+  // --- Mood Log Functions ---
+
+  async logMood(): Promise<void> {
+    if (!this.db || !this.userId()) {
+      this.error.set('Database not ready or user not authenticated.');
+      return;
+    }
+
+    this.isSubmitting.set(true);
+    this.error.set(null);
+
+    const newEntry: MoodEntry = {
+      moodScore: this.newEntryScore(),
+      notes: this.newEntryNotes().trim(),
+      timestamp: Date.now(),
+      userId: this.userId()!,
+    };
+
+    try {
+      const entriesCollection = collection(this.db, this.getCollectionPath('mood_entries'));
+      await addDoc(entriesCollection, newEntry);
+
+      // Reset form
+      this.newEntryScore.set(5);
+      this.newEntryNotes.set('');
+      this.successMessage.set('Mood logged successfully!');
+    } catch (e) {
+      console.error("Error adding mood entry: ", e);
+      this.error.set('Failed to log mood entry.');
+    } finally {
+      this.isSubmitting.set(false);
+    }
+  }
+
+  // --- Generic Item Addition Functions ---
+
+  private async addItem(collectionName: 'user_triggers' | 'user_cravings', itemName: string, resetSignal: (value: string) => void): Promise<void> {
+    if (!this.db || !this.userId()) {
+      this.error.set('Database not ready or user not authenticated.');
+      return;
+    }
+    if (!itemName.trim()) return;
+
+    this.isSubmitting.set(true);
+    this.error.set(null);
+
+    const newItem = {
+      name: itemName.trim(),
+      timestamp: Date.now(),
+      userId: this.userId()!,
+    };
+
+    try {
+      const colRef = collection(this.db, this.getCollectionPath(collectionName));
+      await addDoc(colRef, newItem);
+
+      resetSignal(''); // Reset the input field
+      this.successMessage.set(`${collectionName.replace('user_', '').charAt(0).toUpperCase() + collectionName.slice(5)} added.`);
+    } catch (e) {
+      console.error(`Error adding ${collectionName} item: `, e);
+      this.error.set(`Failed to add item to ${collectionName}.`);
+    } finally {
+      this.isSubmitting.set(false);
+    }
+  }
+
+  async addTrigger(): Promise<void> {
+    await this.addItem('user_triggers', this.newTriggerName(), this.newTriggerName.set);
+  }
+
+  async addCravings(): Promise<void> {
+    await this.addItem('user_cravings', this.newCravingsName(), this.newCravingsName.set);
+  }
+
+  // --- Generic Item Deletion Function ---
+
+  async deleteItem(id: string, type: 'trigger' | 'cravings'): Promise<void> {
+    if (!this.db || !this.userId()) {
+      this.error.set('Database not ready or user not authenticated.');
+      return;
+    }
+
+    this.error.set(null);
+    let collectionName: 'user_triggers' | 'user_cravings';
+    let itemName: string;
+
+    if (type === 'trigger') {
+      collectionName = 'user_triggers';
+      itemName = 'Trigger';
+    } else {
+      collectionName = 'user_cravings';
+      itemName = 'Craving';
+    }
+
+    try {
+      const docRef = doc(this.db, this.getCollectionPath(collectionName), id);
+      await deleteDoc(docRef);
+      this.successMessage.set(`${itemName} deleted.`);
+    } catch (e) {
+      console.error(`Error deleting ${type} item: `, e);
+      this.error.set(`Failed to delete ${itemName}.`);
+    }
+  }
+
+
+  // --- Utility Functions ---
+
+  formatDate(timestamp: number): string {
+    const date = new Date(timestamp);
+    const options: Intl.DateTimeFormatOptions = {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    };
+    return date.toLocaleDateString('en-US', options);
+  }
+
+  getScoreColor(score: number): string {
+    if (score >= 8) return 'text-green-600';
+    if (score >= 6) return 'text-blue-500';
+    if (score >= 4) return 'text-yellow-600';
+    return 'text-red-500';
+  }
+
+  ngOnDestroy(): void {
+    this.unsubscribes.forEach(unsub => unsub());
+  }
+}
+
