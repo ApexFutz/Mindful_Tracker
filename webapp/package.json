@@ -1,0 +1,25 @@
+{
+  "name": "mindful-web",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "start": "npx ng serve --open",
+    "build": "npx ng build"
+  },
+  "dependencies": {
+    "@angular/animations": "^16.2.0",
+    "@angular/common": "^16.2.0",
+    "@angular/compiler": "^16.2.0",
+    "@angular/core": "^16.2.0",
+    "@angular/forms": "^16.2.0",
+    "@angular/platform-browser": "^16.2.0",
+    "@angular/platform-browser-dynamic": "^16.2.0",
+    "rxjs": "^7.8.0",
+    "zone.js": "^0.13.0",
+    "firebase": "^9.23.0"
+  },
+  "devDependencies": {
+    "@angular/cli": "^16.2.0",
+    "typescript": "^5.1.6"
+  }
+}
